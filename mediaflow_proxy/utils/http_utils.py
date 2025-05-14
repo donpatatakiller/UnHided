@@ -30,10 +30,11 @@ class DownloadError(Exception):
         super().__init__(message)
 
 
-def create_httpx_client(follow_redirects: bool = True, timeout: float = 30.0, **kwargs) -> httpx.AsyncClient:
+def create_httpx_client(follow_redirects: bool = True, **kwargs) -> httpx.AsyncClient:
     """Creates an HTTPX client with configured proxy routing"""
     mounts = settings.transport_config.get_mounts()
-    client = httpx.AsyncClient(mounts=mounts, follow_redirects=follow_redirects, timeout=timeout, **kwargs)
+    kwargs.setdefault("timeout", settings.transport_config.timeout)
+    client = httpx.AsyncClient(mounts=mounts, follow_redirects=follow_redirects, **kwargs)
     return client
 
 
@@ -94,6 +95,11 @@ class Streamer:
         self.end_byte = 0
         self.total_size = 0
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type(DownloadError),
+    )
     async def create_streaming_response(self, url: str, headers: dict):
         """
         Creates and sends a streaming request.
@@ -103,9 +109,27 @@ class Streamer:
             headers (dict): The headers to include in the request.
 
         """
-        request = self.client.build_request("GET", url, headers=headers)
-        self.response = await self.client.send(request, stream=True, follow_redirects=True)
-        self.response.raise_for_status()
+        try:
+            request = self.client.build_request("GET", url, headers=headers)
+            self.response = await self.client.send(request, stream=True, follow_redirects=True)
+            self.response.raise_for_status()
+        except httpx.TimeoutException:
+            logger.warning("Timeout while creating streaming response")
+            raise DownloadError(409, "Timeout while creating streaming response")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error {e.response.status_code} while creating streaming response")
+            if e.response.status_code == 404:
+                logger.error(f"Segment Resource not found: {url}")
+                raise e
+            raise DownloadError(
+                e.response.status_code, f"HTTP error {e.response.status_code} while creating streaming response"
+            )
+        except httpx.RequestError as e:
+            logger.error(f"Error creating streaming response: {e}")
+            raise DownloadError(502, f"Error creating streaming response: {e}")
+        except Exception as e:
+            logger.error(f"Error creating streaming response: {e}")
+            raise RuntimeError(f"Error creating streaming response: {e}")
 
     async def stream_content(self) -> typing.AsyncGenerator[bytes, None]:
         """
@@ -258,6 +282,7 @@ def encode_mediaflow_proxy_url(
     encryption_handler: EncryptionHandler = None,
     expiration: int = None,
     ip: str = None,
+    filename: typing.Optional[str] = None,
 ) -> str:
     """
     Encodes & Encrypt (Optional) a MediaFlow proxy URL with query parameters and headers.
@@ -272,10 +297,12 @@ def encode_mediaflow_proxy_url(
         encryption_handler (EncryptionHandler, optional): The encryption handler to use. Defaults to None.
         expiration (int, optional): The expiration time for the encrypted token. Defaults to None.
         ip (str, optional): The public IP address to include in the query parameters. Defaults to None.
+        filename (str, optional): Filename to be preserved for media players like Infuse. Defaults to None.
 
     Returns:
         str: The encoded MediaFlow proxy URL.
     """
+    # Prepare query parameters
     query_params = query_params or {}
     if destination_url is not None:
         query_params["d"] = destination_url
@@ -290,18 +317,47 @@ def encode_mediaflow_proxy_url(
             {key if key.startswith("r_") else f"r_{key}": value for key, value in response_headers.items()}
         )
 
+    # Construct the base URL
+    if endpoint is None:
+        base_url = mediaflow_proxy_url
+    else:
+        base_url = parse.urljoin(mediaflow_proxy_url, endpoint)
+
+    # Ensure base_url doesn't end with a slash for consistent handling
+    if base_url.endswith("/"):
+        base_url = base_url[:-1]
+
+    # Handle encryption if needed
     if encryption_handler:
         encrypted_token = encryption_handler.encrypt_data(query_params, expiration, ip)
-        encoded_params = urlencode({"token": encrypted_token})
+
+        # Parse the base URL to get its components
+        parsed_url = parse.urlparse(base_url)
+
+        # Insert the token at the beginning of the path
+        new_path = f"/_token_{encrypted_token}{parsed_url.path}"
+
+        # Reconstruct the URL with the token at the beginning of the path
+        url_parts = list(parsed_url)
+        url_parts[2] = new_path  # Update the path component
+
+        # Build the URL
+        url = parse.urlunparse(url_parts)
+
+        # Add filename at the end if provided
+        if filename:
+            url = f"{url}/{parse.quote(filename)}"
+
+        return url
     else:
-        encoded_params = urlencode(query_params)
+        # No encryption, use regular query parameters
+        url = base_url
+        if filename:
+            url = f"{url}/{parse.quote(filename)}"
 
-    # Construct the full URL
-    if endpoint is None:
-        return f"{mediaflow_proxy_url}?{encoded_params}"
-
-    base_url = parse.urljoin(mediaflow_proxy_url, endpoint)
-    return f"{base_url}?{encoded_params}"
+        if query_params:
+            return f"{url}?{urlencode(query_params)}"
+        return url
 
 
 def get_original_scheme(request: Request) -> str:
